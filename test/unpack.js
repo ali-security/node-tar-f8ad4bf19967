@@ -3523,3 +3523,370 @@ t.test('linkpath with \\ separators', {
 
   t.end()
 })
+
+// CVE-2026-26960 (GHSA-83g3-92jg-28cx): the linkpath of a link entry is only
+// checked as a string, but the target of a link is resolved on the file
+// system, following any symbolic link that is already there.  A chain of
+// symbolic links that each stay inside the extraction target as strings can
+// walk out of it on disk, and a hard link or a symbolic link made through it
+// then reaches a file outside of the extraction target, which reading or
+// writing the extracted link leaks or clobbers.  So no link may be made to
+// a target that goes through a symbolic link.
+const symlinkErrors = warnings => warnings
+  .filter(w => /^TAR_SYMLINK_ERROR/.test(w[0]))
+
+t.test('no linking through a symlink', {
+  skip: isWindows && 'symlinks not fully supported',
+}, t => {
+  const dir = path.resolve(unpackdir, 'no-link-through-symlink')
+  t.teardown(_ => rimraf.sync(dir))
+
+  // the chain from the upstream fix, and the one from the advisory.  Every
+  // link in them stays inside the extraction target as a string, but on
+  // disk a/b/escape is the directory that the extraction target is in.
+  const chains = {
+    'up/..': [
+      {
+        type: 'SymbolicLink',
+        path: 'a/b/up',
+        linkpath: '../..',
+        mode: 0o755,
+      },
+      {
+        type: 'SymbolicLink',
+        path: 'a/b/escape',
+        linkpath: 'up/..',
+        mode: 0o755,
+      },
+    ],
+    'c/up/../..': [
+      {
+        type: 'SymbolicLink',
+        path: 'a/b/c/up',
+        linkpath: '../..',
+        mode: 0o755,
+      },
+      {
+        type: 'SymbolicLink',
+        path: 'a/b/escape',
+        linkpath: 'c/up/../..',
+        mode: 0o755,
+      },
+    ],
+  }
+  const types = ['Link', 'SymbolicLink']
+
+  let legs = 0
+  const setup = () => {
+    const legdir = path.resolve(dir, String(legs++))
+    rimraf.sync(legdir)
+    mkdirp.sync(path.resolve(legdir, 'x'))
+    fs.writeFileSync(path.resolve(legdir, 'exploited-file'),
+      'original content')
+    return legdir
+  }
+
+  const check = (t, legdir, warnings) => {
+    const cwd = path.resolve(legdir, 'x')
+    const victim = path.resolve(legdir, 'exploited-file')
+    t.equal(symlinkErrors(warnings).length, 1,
+      'refused to link through a symlink')
+    t.throws(_ => fs.lstatSync(path.resolve(cwd, 'exploit')),
+      { code: 'ENOENT' }, 'no link made through the symlink chain')
+    t.equal(fs.statSync(victim).nlink, 1, 'no hard link to the file outside')
+    // the symbolic links of the chain itself are extracted as usual
+    t.ok(fs.lstatSync(path.resolve(cwd, 'a/b/escape')).isSymbolicLink(),
+      'chain symlink extracted')
+    // writing to the extracted entry does not clobber the file outside
+    fs.writeFileSync(path.resolve(cwd, 'exploit'), 'pwned')
+    t.equal(fs.readFileSync(victim, 'utf8'), 'original content',
+      'file outside of the extraction target not clobbered')
+    t.strictSame(fs.readdirSync(legdir).sort(), ['exploited-file', 'x'],
+      'nothing written beside the extraction target')
+    t.end()
+  }
+
+  Object.keys(chains).forEach(chain => types.forEach(type => {
+    const exploit = makeTar(chains[chain].concat([
+      {
+        type: type,
+        path: 'exploit',
+        linkpath: 'a/b/escape/exploited-file',
+        mode: 0o755,
+      },
+      '',
+      '',
+    ]))
+
+    t.test(chain + ' ' + type, t => {
+      t.test('sync', t => {
+        const legdir = setup()
+        const warnings = []
+        new UnpackSync({
+          cwd: path.resolve(legdir, 'x'),
+          onwarn: (w, d) => warnings.push([w, d]),
+        }).end(exploit)
+        check(t, legdir, warnings)
+      })
+
+      t.test('async', t => {
+        const legdir = setup()
+        const warnings = []
+        new Unpack({
+          cwd: path.resolve(legdir, 'x'),
+          onwarn: (w, d) => warnings.push([w, d]),
+        }).on('close', _ => check(t, legdir, warnings)).end(exploit)
+      })
+
+      t.test('sync strict', t => {
+        const legdir = setup()
+        const warnings = []
+        new UnpackSync({
+          cwd: path.resolve(legdir, 'x'),
+          strict: true,
+        }).on('error', er => warnings.push([er.message, er])).end(exploit)
+        check(t, legdir, warnings)
+      })
+
+      t.test('async strict', t => {
+        const legdir = setup()
+        const warnings = []
+        new Unpack({
+          cwd: path.resolve(legdir, 'x'),
+          strict: true,
+        }).on('error', er => warnings.push([er.message, er]))
+          .on('close', _ => check(t, legdir, warnings)).end(exploit)
+      })
+
+      t.end()
+    })
+  }))
+
+  t.end()
+})
+
+// The same, with no symlink chain in the archive at all: a symbolic link
+// that is already on disk in the extraction target, and points outside of
+// it, may not be linked through either.
+t.test('no linking through a symlink already on disk', {
+  skip: isWindows && 'symlinks not fully supported',
+}, t => {
+  const dir = path.resolve(unpackdir, 'no-link-through-disk-symlink')
+  t.teardown(_ => rimraf.sync(dir))
+
+  const data = makeTar([
+    {
+      type: 'File',
+      path: 'real/file.txt',
+      size: 'inside'.length,
+    },
+    'inside',
+    {
+      type: 'Link',
+      path: 'exploit_hard',
+      linkpath: 'x/victim.txt',
+    },
+    {
+      type: 'SymbolicLink',
+      path: 'exploit_sym',
+      linkpath: 'x/victim.txt',
+    },
+    // resolved from the directory the symbolic link is in
+    {
+      type: 'SymbolicLink',
+      path: 'sub/exploit_sym',
+      linkpath: '../x/victim.txt',
+    },
+    // links that do not go through a symbolic link are made as usual
+    {
+      type: 'Link',
+      path: 'ok_hard',
+      linkpath: 'real/file.txt',
+    },
+    {
+      type: 'SymbolicLink',
+      path: 'ok_sym',
+      linkpath: 'real/file.txt',
+    },
+    '',
+    '',
+  ])
+
+  const setup = leg => {
+    const legdir = path.resolve(dir, leg)
+    rimraf.sync(legdir)
+    const cwd = path.resolve(legdir, 'cwd')
+    const outside = path.resolve(legdir, 'outside')
+    mkdirp.sync(cwd)
+    mkdirp.sync(outside)
+    fs.writeFileSync(path.resolve(outside, 'victim.txt'), 'ORIGINAL DATA')
+    fs.symlinkSync(outside, path.resolve(cwd, 'x'))
+    return {
+      legdir: legdir,
+      cwd: cwd,
+      victim: path.resolve(outside, 'victim.txt'),
+    }
+  }
+
+  const checkOk = (t, cwd) => {
+    t.equal(fs.lstatSync(path.resolve(cwd, 'ok_hard')).ino,
+      fs.lstatSync(path.resolve(cwd, 'real/file.txt')).ino,
+      'hard link inside the extraction target made')
+    t.equal(fs.readlinkSync(path.resolve(cwd, 'ok_sym')), 'real/file.txt',
+      'symbolic link inside the extraction target made')
+    t.equal(fs.readFileSync(path.resolve(cwd, 'ok_sym'), 'utf8'), 'inside')
+  }
+
+  const check = (t, leg, warnings) => {
+    const cwd = leg.cwd
+    t.strictSame(symlinkErrors(warnings).map(w => w[0]), [
+      'TAR_SYMLINK_ERROR: Cannot extract through symbolic link',
+      'TAR_SYMLINK_ERROR: Cannot extract through symbolic link',
+      'TAR_SYMLINK_ERROR: Cannot extract through symbolic link',
+    ], 'refused every link through the symlink')
+    ;['exploit_hard', 'exploit_sym', 'sub/exploit_sym'].forEach(f =>
+      t.throws(_ => fs.lstatSync(path.resolve(cwd, f)), { code: 'ENOENT' },
+        f + ' not made through the symlink'))
+    t.equal(fs.statSync(leg.victim).nlink, 1, 'no hard link to the victim')
+    ;['exploit_hard', 'exploit_sym', 'sub/exploit_sym'].forEach(f =>
+      fs.writeFileSync(path.resolve(cwd, f), 'OVERWRITTEN'))
+    t.equal(fs.readFileSync(leg.victim, 'utf8'), 'ORIGINAL DATA',
+      'victim not clobbered')
+    checkOk(t, cwd)
+    t.end()
+  }
+
+  t.test('sync', t => {
+    const leg = setup('sync')
+    const warnings = []
+    new UnpackSync({
+      cwd: leg.cwd,
+      onwarn: (w, d) => warnings.push([w, d]),
+    }).end(data)
+    check(t, leg, warnings)
+  })
+
+  t.test('async', t => {
+    const leg = setup('async')
+    const warnings = []
+    new Unpack({
+      cwd: leg.cwd,
+      onwarn: (w, d) => warnings.push([w, d]),
+    }).on('close', _ => check(t, leg, warnings)).end(data)
+  })
+
+  // preservePaths allows unpacking through symbolic links
+  const checkPreserve = (t, leg, warnings) => {
+    const cwd = leg.cwd
+    t.strictSame(symlinkErrors(warnings), [], 'no symlink errors')
+    t.equal(fs.statSync(leg.victim).nlink, 2, 'hard link made as asked')
+    t.equal(fs.readlinkSync(path.resolve(cwd, 'exploit_sym')), 'x/victim.txt')
+    t.equal(fs.readlinkSync(path.resolve(cwd, 'sub/exploit_sym')),
+      '../x/victim.txt')
+    checkOk(t, cwd)
+    t.end()
+  }
+
+  t.test('sync preservePaths', t => {
+    const leg = setup('sync-preserve')
+    const warnings = []
+    new UnpackSync({
+      cwd: leg.cwd,
+      preservePaths: true,
+      onwarn: (w, d) => warnings.push([w, d]),
+    }).end(data)
+    checkPreserve(t, leg, warnings)
+  })
+
+  t.test('async preservePaths', t => {
+    const leg = setup('async-preserve')
+    const warnings = []
+    new Unpack({
+      cwd: leg.cwd,
+      preservePaths: true,
+      onwarn: (w, d) => warnings.push([w, d]),
+    }).on('close', _ => checkPreserve(t, leg, warnings)).end(data)
+  })
+
+  t.end()
+})
+
+// The extraction target itself may be a symbolic link, so links to targets
+// spelled with './', or to the extraction target itself, are made as usual.
+t.test('links in an extraction target that is a symlink', {
+  skip: isWindows && 'symlinks not fully supported',
+}, t => {
+  const dir = path.resolve(unpackdir, 'link-in-symlink-cwd')
+  t.teardown(_ => rimraf.sync(dir))
+
+  const data = makeTar([
+    {
+      type: 'File',
+      path: 'file.txt',
+      size: 'hello'.length,
+    },
+    'hello',
+    {
+      type: 'Link',
+      path: 'hard',
+      linkpath: './file.txt',
+    },
+    {
+      type: 'SymbolicLink',
+      path: 'sym',
+      linkpath: './file.txt',
+    },
+    {
+      type: 'SymbolicLink',
+      path: 'sub/up',
+      linkpath: '..',
+    },
+    {
+      type: 'SymbolicLink',
+      path: 'self',
+      linkpath: '.',
+    },
+    '',
+    '',
+  ])
+
+  const setup = leg => {
+    const legdir = path.resolve(dir, leg)
+    rimraf.sync(legdir)
+    mkdirp.sync(path.resolve(legdir, 'real'))
+    fs.symlinkSync(path.resolve(legdir, 'real'), path.resolve(legdir, 'cwd'))
+    return path.resolve(legdir, 'cwd')
+  }
+
+  const check = (t, cwd, warnings) => {
+    t.strictSame(warnings, [], 'no warnings')
+    t.equal(fs.lstatSync(path.resolve(cwd, 'hard')).ino,
+      fs.lstatSync(path.resolve(cwd, 'file.txt')).ino, 'hard link made')
+    t.equal(fs.readlinkSync(path.resolve(cwd, 'sym')), './file.txt')
+    t.equal(fs.readlinkSync(path.resolve(cwd, 'sub/up')), '..')
+    t.equal(fs.readlinkSync(path.resolve(cwd, 'self')), '.')
+    t.equal(fs.readFileSync(path.resolve(cwd, 'sub/up/sym'), 'utf8'), 'hello')
+    t.end()
+  }
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    const warnings = []
+    new UnpackSync({
+      cwd: cwd,
+      onwarn: (w, d) => warnings.push([w, d]),
+    }).end(data)
+    check(t, cwd, warnings)
+  })
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    const warnings = []
+    new Unpack({
+      cwd: cwd,
+      onwarn: (w, d) => warnings.push([w, d]),
+    }).on('close', _ => check(t, cwd, warnings)).end(data)
+  })
+
+  t.end()
+})
