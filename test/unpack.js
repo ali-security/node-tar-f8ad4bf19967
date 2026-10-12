@@ -3524,6 +3524,132 @@ t.test('linkpath with \\ separators', {
   t.end()
 })
 
+// CVE-2026-29786 (GHSA-qffp-2rhf-9h96): the root of a linkpath comes off
+// before the '..' check, but on windows \ is a separator just like /, so in a
+// drive-relative linkpath like 'c:..\target.txt' the '..' that is left once
+// the root is gone walks out of the extraction target, and a hard link made
+// there clobbers whatever it points at when the extracted entry is written
+// to.  An archive can be extracted on any platform, so the '..' check looks
+// between \ separators too, on posix as well, without faking the platform.
+t.test('drive-relative linkpath with \\ separators', {
+  skip: isWindows && 'symlinks not fully supported',
+}, t => {
+  const dir = path.resolve(unpackdir, 'drive-relative-linkpath')
+  t.teardown(_ => rimraf.sync(dir))
+
+  const data = makeTar([
+    // the advisory's vector, a hard link to a file outside of the target
+    {
+      path: 'escape.txt',
+      type: 'Link',
+      linkpath: 'C:../target.txt',
+    },
+    // the same, spelled with the windows separator
+    {
+      path: 'hard_bs',
+      type: 'Link',
+      linkpath: 'c:..\\target.txt',
+    },
+    {
+      path: 'hard_nodrive',
+      type: 'Link',
+      linkpath: '..\\target.txt',
+    },
+    // symbolic links that walk out once the drive root comes off
+    {
+      path: 'sym_bs',
+      type: 'SymbolicLink',
+      linkpath: 'c:..\\target.txt',
+    },
+    {
+      path: 'sub/sym_deep',
+      type: 'SymbolicLink',
+      linkpath: 'c:..\\..\\target.txt',
+    },
+    // the entry path is checked the same way
+    {
+      path: 'c:..\\file.txt',
+      type: 'File',
+      size: 1,
+    },
+    'x',
+    // the drive root comes off, and what is left stays inside the target
+    // when it is resolved from the directory the link is in
+    {
+      path: 'a/winrootdotslink',
+      type: 'SymbolicLink',
+      linkpath: 'c:..\\foo\\bar',
+    },
+    '',
+    '',
+  ])
+
+  const setup = leg => {
+    const legdir = path.resolve(dir, leg)
+    rimraf.sync(legdir)
+    mkdirp.sync(path.resolve(legdir, 'cwd'))
+    fs.writeFileSync(path.resolve(legdir, 'target.txt'), 'ORIGINAL DATA')
+    return legdir
+  }
+
+  const check = (t, legdir, warnings) => {
+    const cwd = path.resolve(legdir, 'cwd')
+    const target = path.resolve(legdir, 'target.txt')
+
+    // what is left of 'c:..\target.txt' once the root is gone points
+    // outside of the extraction target on windows
+    assertEscapes(t, '..\\target.txt')
+
+    t.strictSame(warnings, [
+      ['linkpath contains \'..\'', 'C:../target.txt'],
+      ['linkpath contains \'..\'', 'c:..\\target.txt'],
+      ['linkpath contains \'..\'', '..\\target.txt'],
+      ['linkpath escapes extraction directory', 'c:..\\target.txt'],
+      ['linkpath escapes extraction directory', 'c:..\\..\\target.txt'],
+      ['path contains \'..\'', 'c:..\\file.txt'],
+      ['stripping c: from absolute linkpath', 'c:..\\foo\\bar'],
+    ], 'warned about every path and linkpath that was sanitized')
+
+    t.equal(fs.statSync(target).nlink, 1, 'no hard link to the target')
+    t.strictSame(fs.readdirSync(cwd), ['a'],
+      'only the symlink that stays inside was created')
+    t.strictSame(fs.readdirSync(path.resolve(cwd, 'a')), ['winrootdotslink'])
+    t.equal(fs.readlinkSync(path.resolve(cwd, 'a/winrootdotslink')),
+      '..\\foo\\bar', 'symlink target should have root stripped')
+
+    // writing to the extracted entries does not clobber the target
+    ;['escape.txt', 'hard_bs', 'hard_nodrive'].forEach(f =>
+      fs.writeFileSync(path.resolve(cwd, f), 'OVERWRITTEN'))
+    t.equal(fs.readFileSync(target, 'utf8'), 'ORIGINAL DATA',
+      'target was not clobbered through a hard link')
+
+    t.strictSame(fs.readdirSync(legdir).sort(), ['cwd', 'target.txt'],
+      'nothing written beside the extraction target')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const legdir = setup('async')
+    const warnings = []
+    new Unpack({
+      cwd: path.resolve(legdir, 'cwd'),
+      onwarn: (w, d) => warnings.push([w, d]),
+    }).on('close', _ => check(t, legdir, warnings)).end(data)
+  })
+
+  t.test('sync', t => {
+    const legdir = setup('sync')
+    const warnings = []
+    new UnpackSync({
+      cwd: path.resolve(legdir, 'cwd'),
+      onwarn: (w, d) => warnings.push([w, d]),
+    }).end(data)
+    check(t, legdir, warnings)
+  })
+
+  t.end()
+})
+
 // CVE-2026-26960 (GHSA-83g3-92jg-28cx): the linkpath of a link entry is only
 // checked as a string, but the target of a link is resolved on the file
 // system, following any symbolic link that is already there.  A chain of
