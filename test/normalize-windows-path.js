@@ -16,6 +16,12 @@ t.test('posix', t => {
   const normPath = reload('../lib/normalize-windows-path.js')
   t.equal(normPath('/some/path/back\\slashes'), '/some/path/back\\slashes')
   t.equal(normPath('c:\\foo\\bar'), 'c:\\foo\\bar')
+  // a pax header can carry a path that looks like a number; everything
+  // downstream of here does string work on it, so hand back a string
+  t.equal(normPath(12345), '12345')
+  t.equal(typeof normPath(12345), 'string')
+  // a missing path is passed through as it is
+  t.equal(normPath(undefined), undefined)
   t.end()
 })
 
@@ -27,5 +33,8 @@ t.test('win32', t => {
   const normPath = reload('../lib/normalize-windows-path.js')
   t.equal(normPath('/some/path/back\\slashes'), '/some/path/back/slashes')
   t.equal(normPath('c:\\foo\\bar'), 'c:/foo/bar')
+  t.equal(normPath(12345), '12345')
+  t.equal(typeof normPath(12345), 'string')
+  t.equal(normPath(undefined), undefined)
   t.end()
 })
