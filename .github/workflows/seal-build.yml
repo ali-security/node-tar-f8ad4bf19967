@@ -1,0 +1,25 @@
+name: seal-build
+on:
+  workflow_dispatch:
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '12'
+      - name: Pack
+        run: |
+          node --version
+          npm --version
+          mkdir -p dist
+          npm pack
+          mv tar-4.4.13.tgz dist/
+          tar tzvf dist/tar-4.4.13.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tar-4.4.13
+          path: dist/tar-4.4.13.tgz
+          if-no-files-found: error
