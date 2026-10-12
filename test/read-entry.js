@@ -223,3 +223,55 @@ t.test('entry without mode', t => {
 
   t.end()
 })
+
+t.test('do not apply ex/gex to meta entries', t => {
+  // CVE-2026-53655: a pending extended header describes the next *file*
+  // entry, never an intermediary x/g/L/K/N/X extension header.  Applying a
+  // pending pax `size` to a meta entry makes it look bigger than it is,
+  // which hides its body behind maxMetaEntrySize.
+  const ex = { size: 1024, path: 'smuggled/evil.txt', dev: 5678 }
+  const gex = { ino: 9876, uid: 1234 }
+  const metaTypes = [
+    'NextFileHasLongPath',
+    'NextFileHasLongLinkpath',
+    'OldGnuLongPath',
+    'ExtendedHeader',
+    'GlobalExtendedHeader',
+    'OldExtendedHeader'
+  ]
+
+  metaTypes.forEach(type => {
+    const h = new Header({
+      path: '././@LongLink',
+      type: type,
+      uid: 0,
+      size: 18
+    })
+    h.encode()
+    const entry = new ReadEntry(new Header(h.block), ex, gex)
+    t.equal(entry.meta, true, type + ' is a meta entry')
+    t.equal(entry.size, 18, 'expect ' + type + ' to ignore extended size')
+    t.equal(entry.remain, 18, 'expect ' + type + ' remain to match header')
+    t.equal(entry.path, '././@LongLink',
+            'expect ' + type + ' to ignore extended path')
+    t.equal(entry.uid, 0, 'expect ' + type + ' to ignore global uid')
+    t.equal(entry.dev, undefined, 'expect ' + type + ' to ignore extended dev')
+    t.equal(entry.ino, undefined, 'expect ' + type + ' to ignore global ino')
+  })
+
+  const fh = new Header({
+    path: 'innocent.txt',
+    type: 'File',
+    uid: 0,
+    size: 18
+  })
+  fh.encode()
+  const file = new ReadEntry(new Header(fh.block), ex, gex)
+  t.equal(file.meta, false, 'File is not a meta entry')
+  t.equal(file.size, 1024, 'File respects extended size')
+  t.equal(file.path, 'smuggled/evil.txt', 'File respects extended path')
+  t.equal(file.dev, 5678, 'File respects extended dev')
+  t.equal(file.uid, 1234, 'File respects global uid')
+  t.equal(file.ino, 9876, 'File respects global ino')
+  t.end()
+})
